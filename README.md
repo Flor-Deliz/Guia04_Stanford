@@ -1,67 +1,53 @@
-# Portal de autenticación
+# Aula Segura – Stanford (prototipo académico)
 
-Aplicación de ejemplo para el Ejercicio 1.2. Incluye una interfaz web y una API JSON desarrolladas con Flask, con persistencia en SQLite.
+Prototipo Flask de autenticación y gestión básica de tareas para la Guía Práctica N.º 04. No es una aplicación oficial ni está afiliada a Stanford.
 
-## Requisitos
+## Estructura
 
-- Python 3.10 o superior
-- `pip`
+- `app.py`: aplicación Flask, autenticación, sesiones, recuperación y tareas.
+- `templates/index.html`: interfaz HTML con formularios CSRF.
+- `static/app.js`: lectura segura del token desde el fragmento del enlace de recuperación.
+- `static/password-recommendations.js`: ayuda visual de longitud de contraseña (no sustituye validación del servidor).
+- `test_auth.py`: suite automatizada.
+- `requirements.txt`: dependencias.
+- `Procfile`: comando de inicio para Render/Gunicorn.
 
-## Instalación y ejecución
-
-En PowerShell, desde la carpeta del proyecto:
+## Ejecutar en Windows (PowerShell)
 
 ```powershell
-python -m venv venv
-.\venv\Scripts\Activate.ps1
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
-python auth_app.py
+python -m pytest -v test_auth.py
+python -m pytest -v test_auth.py --junitxml=resultados.xml
+python app.py
 ```
 
-Abre [http://127.0.0.1:5000](http://127.0.0.1:5000) para usar el prototipo web. La base de datos `auth.db` se crea en el directorio actual al iniciar la aplicación.
+Abrir `http://127.0.0.1:5000`.
 
-Para ejecutar las pruebas:
+## Variables de entorno
 
-```powershell
-python -m pytest -q
-```
+En desarrollo, la aplicación genera una clave temporal si no existe `SECRET_KEY`. En producción, configura una clave fija y privada:
 
-## Funcionalidades
+- `SECRET_KEY`: clave aleatoria larga generada fuera del repositorio.
+- `PRODUCTION=1`: activa cookies `Secure` y HSTS.
+- `DATABASE`: ruta de base de datos. En hosting debe apuntar a almacenamiento persistente si se necesita conservar datos.
+- `BASE_URL`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`: configuración para SMTP_SSL de recuperación.
+- `TRUST_PROXY=1`: solo si se ha confirmado que el proveedor y la cadena de proxy permiten confiar en un salto `X-Forwarded-For`.
 
-- Registro e inicio de sesión desde la interfaz web o la API.
-- Contraseñas almacenadas con hash `scrypt`; la longitud permitida es de 10 a 128 caracteres.
-- Sesiones con expiración, cierre y revocación al cambiar o restablecer la contraseña.
-- Límite de intentos fallidos por cuenta y por IP, con bloqueo progresivo.
-- Tokens de restablecimiento de un solo uso y con vencimiento.
-- Protección CSRF en formularios web y cabeceras HTTP de seguridad.
+No publiques `.env`, secretos, contraseñas SMTP ni bases de datos con información real.
 
-## API JSON
+## Despliegue Render
 
-Las rutas de la API aceptan y responden JSON:
+- Runtime: Python 3
+- Build command: `pip install -r requirements.txt`
+- Start command: `gunicorn "app:create_app()" --workers 1 --threads 2 --access-logfile -`
+- Variables: `SECRET_KEY` y `PRODUCTION=1`.
 
-| Método | Ruta | Descripción |
-| --- | --- | --- |
-| `POST` | `/register` | Registrar una cuenta (`email`, `password`). |
-| `POST` | `/login` | Iniciar sesión; devuelve un token. |
-| `GET` | `/me` | Consultar la cuenta autenticada. |
-| `POST` | `/logout` | Cerrar la sesión autenticada. |
-| `POST` | `/password/change` | Cambiar la contraseña autenticada (`actual`, `nueva`). |
-| `POST` | `/password/forgot` | Solicitar un restablecimiento (`email`). |
-| `POST` | `/password/reset` | Restablecer la contraseña (`token`, `nueva`). |
+**Limitaciones que deben declararse:** el sistema de archivos del plan gratuito de Render es efímero; SQLite puede perder datos al reiniciar o desplegar. Para persistencia, usar una base de datos administrada (por ejemplo PostgreSQL) o un disco persistente disponible en el plan elegido. El envío SMTP de este prototipo requiere un servidor compatible; si el hosting bloquea SMTP, integrar un proveedor de correo por HTTPS antes de afirmar que la recuperación por correo está operativa.
 
-Para las rutas que requieren autenticación, envía el token en la cabecera:
+## Controles implementados en el código
 
-```http
-Authorization: Bearer <token>
-```
+Argon2id; consultas SQL parametrizadas; mensajes genéricos en login; limitación progresiva por cuenta e IP (la IP depende de la configuración del proxy); sesiones registradas en servidor con vencimiento de 30 minutos; regeneración del identificador al autenticar; revocación de sesiones al cambiar/restablecer contraseña; tokens de recuperación aleatorios con digest SHA-256, vencimiento de 15 minutos y consumo de un solo uso; CSRF en POST; cabeceras de seguridad; renderizado con autoescape de Jinja.
 
-La aplicación también incluye páginas web para iniciar sesión, registrarse y acceder al panel.
-
-## Configuración
-
-- `AUTH_DB`: ruta de la base de datos SQLite; por defecto, `auth.db`.
-- `COOKIE_SECURE`: al establecerlo en `1`, las cookies se envían únicamente por HTTPS. En desarrollo local queda desactivado.
-
-## Nota
-
-Este proyecto es un prototipo educativo, no una configuración lista para producción. El envío del correo de restablecimiento está simulado y debe implementarse antes de usar esa función en un entorno real. Para producción, también se debe desplegar detrás de HTTPS y configurar `COOKIE_SECURE=1`.
+La suite ampliada incluida en esta entrega debe ejecutarse en el entorno Windows del equipo antes de reportar sus resultados. Las cinco pruebas PASSED que aparecen en las capturas corresponden a la ejecución anterior, no constituyen por sí mismas una ejecución de esta versión corregida.

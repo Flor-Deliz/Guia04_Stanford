@@ -1,123 +1,401 @@
-import os, time, secrets, hashlib, sqlite3, smtplib, hmac
+"""Aula Segura / TaskSecure - prototipo académico de autenticación segura."""
+from __future__ import annotations
+
+import hashlib
+import hmac
+import os
+import secrets
+import smtplib
+import sqlite3
+import time
 from email.message import EmailMessage
-from flask import Flask, request, session, render_template, redirect, url_for, g, abort
+from pathlib import Path
+from typing import Callable
+
 from argon2 import PasswordHasher
-from argon2.exceptions import VerificationError
+from argon2.exceptions import InvalidHashError, VerificationError
+from flask import Flask, abort, g, redirect, render_template, request, session
 from werkzeug.middleware.proxy_fix import ProxyFix
-ph=PasswordHasher(time_cost=3,memory_cost=65536,parallelism=2)
-dummy=ph.hash(secrets.token_urlsafe(32))
-def digest(x): return hashlib.sha256(x.encode()).hexdigest()
-def create_app(config=None):
- a=Flask(__name__); a.config.update(SECRET_KEY=os.getenv('SECRET_KEY') or secrets.token_hex(32), DATABASE=os.getenv('DATABASE','tasksecure.db'), SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax', SESSION_COOKIE_SECURE=os.getenv('PRODUCTION')=='1', MAX_CONTENT_LENGTH=16384, RESET_SENDER=None)
- if config:a.config.update(config)
- if os.getenv('TRUST_PROXY')=='1':a.wsgi_app=ProxyFix(a.wsgi_app,x_for=1,x_proto=1)
- def db():
-  if 'db' not in g:g.db=sqlite3.connect(a.config['DATABASE'],timeout=15);g.db.row_factory=sqlite3.Row
-  return g.db
- @a.teardown_appcontext
- def close(e):
-  if 'db' in g:g.db.close()
- with a.app_context():
-  db().executescript('CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,email TEXT UNIQUE,password TEXT,role TEXT DEFAULT "student"); CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,uid INTEGER,expires INTEGER); CREATE TABLE IF NOT EXISTS resets(token TEXT PRIMARY KEY,uid INTEGER,expires INTEGER); CREATE TABLE IF NOT EXISTS limits(k TEXT PRIMARY KEY,n INTEGER,level INTEGER,until INTEGER,last INTEGER); CREATE TABLE IF NOT EXISTS tasks(id INTEGER PRIMARY KEY,uid INTEGER,title TEXT);');db().commit()
- def audit(event,uid=None):a.logger.warning('security_event=%s uid=%s',event,uid)
- def verify(encoded,p):
-  try:return ph.verify(encoded,p)
-  except VerificationError:return False
- def keys(email,kind='login'):return [kind+':account:'+digest(email),kind+':ip:'+digest(request.remote_addr or '')]
- def remaining(ks):
-  return max([0]+[max(0,r['until']-int(time.time())) for k in ks if (r:=db().execute('SELECT * FROM limits WHERE k=?',(k,)).fetchone())])
- def fail(ks, thresholds=(5,20)):
-  now=int(time.time())
-  for k,threshold in zip(ks,thresholds):
-   r=db().execute('SELECT * FROM limits WHERE k=?',(k,)).fetchone(); n,level=(r['n'],r['level']) if r and now-r['last']<3600 else (0,0);n+=1;until=0
-   if n>=threshold:level+=1;n=0;until=now+min(900,60*2**min(level-1,4))
-   db().execute('INSERT OR REPLACE INTO limits VALUES(?,?,?,?,?)',(k,n,level,until,now))
-  db().commit()
- def user():
-  return db().execute('SELECT users.* FROM users JOIN sessions ON users.id=sessions.uid WHERE token=? AND expires>?',(digest(session.get('sid','')),int(time.time()))).fetchone()
- @a.before_request
- def csrf():
-  if request.method=='POST' and not hmac.compare_digest(session.get('csrf','!'),request.form.get('csrf','')):abort(400)
-  if 'csrf' not in session:session['csrf']=secrets.token_urlsafe(32)
- @a.after_request
- def headers(r):
-  r.headers['Cache-Control']='no-store';r.headers['Referrer-Policy']='no-referrer';r.headers['X-Content-Type-Options']='nosniff';r.headers['Content-Security-Policy']="default-src 'self'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; form-action 'self'";return r
- def page(title,msg='',status=200,**kw):return render_template('index.html',title=title,msg=msg,**kw),status
- def valid(p):return 12<=len(p)<=128
- def email_input():return request.form.get('email','').strip().lower()[:254]
- def institutional_email(e):
-  local,sep,domain=e.rpartition('@')
-  domain=domain.lower()
-  authorized=domain=='edu.pe' or domain.endswith('.edu.pe')
-  return bool(local and sep and authorized)
- @a.route('/',methods=['GET','POST'])
- def login():
-  if request.method=='GET':return page('Iniciar sesión')
-  e=email_input();p=request.form.get('password','');ks=keys(e);d=db();d.execute('BEGIN IMMEDIATE')
-  if not institutional_email(e):return page('Iniciar sesión','Solo se permiten correos institucionales universitarios que terminen en .edu.pe.',400)
-  if (wait:=remaining(ks)):return page('Iniciar sesión',f'Acceso temporalmente bloqueado. Reintente en {wait} segundos.',429)
-  u=d.execute('SELECT * FROM users WHERE email=?',(e,)).fetchone()
-  ok=verify(u['password'] if u else dummy,p[:128]) and len(p)<=128
-  if not u or not ok:
-   fail(ks);audit('login_failed');wait=remaining(ks);return page('Iniciar sesión',f'Acceso temporalmente bloqueado. Reintente en {wait} segundos.' if wait else 'Correo electrónico o contraseña incorrectos.',429 if wait else 401)
-  d.execute('DELETE FROM sessions WHERE token=?',(digest(session.get('sid','')),));d.execute('DELETE FROM limits WHERE k=?',(ks[0],));session.clear();sid=secrets.token_urlsafe(32);session.update(sid=sid,csrf=secrets.token_urlsafe(32));d.execute('INSERT INTO sessions VALUES(?,?,?)',(digest(sid),u['id'],int(time.time())+1800));d.commit();audit('login_success',u['id']);return redirect('/dashboard')
- @a.route('/register',methods=['GET','POST'])
- def register():
-  if request.method=='GET':return page('Registro')
-  e=email_input();p=request.form.get('password','');ks=keys(e,'register');db().execute('BEGIN IMMEDIATE')
-  if remaining(ks):return page('Registro','Demasiadas solicitudes.',429)
-  fail(ks,(5,20))
-  if not institutional_email(e):return page('Registro','Solo se permiten correos institucionales universitarios que terminen en .edu.pe.',400)
-  if not valid(p):return page('Registro','Contraseña de 12 a 128 caracteres requerida.',400)
-  db().execute('INSERT OR IGNORE INTO users(email,password) VALUES(?,?)',(e,ph.hash(p)));db().commit();return page('Registro','Solicitud procesada. Puede intentar iniciar sesión.')
- @a.route('/dashboard',methods=['GET','POST'])
- def dashboard():
-  u=user()
-  if not u:return redirect('/')
-  if request.method=='POST':
-   title=request.form.get('task','').strip()
-   if not 3<=len(title)<=120:abort(400)
-   db().execute('INSERT INTO tasks(uid,title) VALUES(?,?)',(u['id'],title));db().commit()
-  return page('Panel de tareas',u=u,tasks=db().execute('SELECT * FROM tasks WHERE uid=?',(u['id'],)).fetchall())
- @a.post('/logout')
- def logout():
-  db().execute('DELETE FROM sessions WHERE token=?',(digest(session.get('sid','')),));db().commit();session.clear();return redirect('/')
- def replace(uid,p):
-  db().execute('UPDATE users SET password=? WHERE id=?',(ph.hash(p),uid));db().execute('DELETE FROM sessions WHERE uid=?',(uid,));db().execute('DELETE FROM resets WHERE uid=?',(uid,));db().commit();audit('password_updated',uid)
- @a.route('/change',methods=['GET','POST'])
- def change():
-  u=user()
-  if not u:return redirect('/')
-  if request.method=='GET':return page('Cambiar contraseña')
-  db().execute('BEGIN IMMEDIATE');u=user()
-  if not u:return redirect('/')
-  p=request.form.get('password','');ks=keys(u['email'],'change')
-  if remaining(ks):return page('Cambiar contraseña','Acceso temporalmente bloqueado.',429)
-  if not verify(u['password'],request.form.get('current','')[:128]):fail(ks);return page('Cambiar contraseña','Credenciales incorrectas.',401)
-  if not valid(p):return page('Cambiar contraseña','Contraseña de 12 a 128 caracteres requerida.',400)
-  replace(u['id'],p);session.clear();return redirect('/')
- def send(e,t):
-  if a.config['RESET_SENDER']:return a.config['RESET_SENDER'](e,t)
-  m=EmailMessage();m['Subject']='Recuperación TaskSecure';m['From']=os.environ['SMTP_USER'];m['To']=e;m.set_content(os.environ['BASE_URL'].rstrip('/')+'/reset#token='+t)
-  with smtplib.SMTP_SSL(os.environ['SMTP_HOST'],int(os.getenv('SMTP_PORT','465')),timeout=10) as s:s.login(os.environ['SMTP_USER'],os.environ['SMTP_PASSWORD']);s.send_message(m)
- @a.route('/forgot',methods=['GET','POST'])
- def forgot():
-  if request.method=='GET':return page('Recuperar contraseña')
-  e=email_input();ks=keys(e,'forgot');db().execute('BEGIN IMMEDIATE')
-  if not institutional_email(e):return page('Recuperar contraseña','Solo se permiten correos institucionales universitarios que terminen en .edu.pe.',400)
-  if remaining(ks):return page('Recuperar contraseña','Demasiadas solicitudes.',429)
-  fail(ks,(3,15));u=db().execute('SELECT * FROM users WHERE email=?',(e,)).fetchone()
-  if u:
-   t=secrets.token_urlsafe(32);db().execute('BEGIN IMMEDIATE');db().execute('DELETE FROM resets WHERE uid=?',(u['id'],));db().execute('INSERT INTO resets VALUES(?,?,?)',(digest(t),u['id'],int(time.time())+900));db().commit();audit('reset_requested',u['id'])
-   try:send(e,t)
-   except Exception:audit('mail_delivery_failed',u['id'])
-  return page('Recuperar contraseña','Si existe la cuenta, recibirá instrucciones por correo.')
- @a.route('/reset',methods=['GET','POST'])
- def reset():
-  if request.method=='GET':return page('Restablecer contraseña')
-  p=request.form.get('password','');t=request.form.get('token','');db().execute('BEGIN IMMEDIATE');r=db().execute('SELECT * FROM resets WHERE token=? AND expires>?',(digest(t),int(time.time()))).fetchone()
-  if not r:return page('Restablecer contraseña','Enlace inválido o expirado.',400)
-  if not valid(p):return page('Restablecer contraseña','Contraseña de 12 a 128 caracteres requerida.',400)
-  replace(r['uid'],p);session.clear();return redirect('/')
- return a
-if __name__=='__main__':create_app().run()
+
+PASSWORD_HASHER = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=2)
+DUMMY_HASH = PASSWORD_HASHER.hash(secrets.token_urlsafe(32))
+SESSION_TTL = 30 * 60
+RESET_TTL = 15 * 60
+
+
+def digest(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def create_app(config: dict | None = None) -> Flask:
+    app = Flask(__name__)
+    configured_secret = os.getenv("SECRET_KEY") or (config or {}).get("SECRET_KEY")
+    if os.getenv("PRODUCTION") == "1" and not configured_secret:
+        raise RuntimeError("SECRET_KEY es obligatoria en producción")
+    app.config.update(
+        SECRET_KEY=configured_secret or secrets.token_hex(32),
+        DATABASE=os.getenv("DATABASE", "tasksecure.db"),
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE="Lax",
+        SESSION_COOKIE_SECURE=os.getenv("PRODUCTION") == "1",
+        PERMANENT_SESSION_LIFETIME=SESSION_TTL,
+        MAX_CONTENT_LENGTH=16 * 1024,
+        RESET_SENDER=None,
+        ALLOWED_EMAIL_DOMAINS=("edu.pe",),
+        TRUST_PROXY=os.getenv("TRUST_PROXY") == "1",
+    )
+    if config:
+        app.config.update(config)
+    # Activar solo cuando el servicio está detrás de un proxy conocido y configurado.
+    if app.config.get("TRUST_PROXY"):
+        app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
+
+    def db() -> sqlite3.Connection:
+        if "db" not in g:
+            database = app.config["DATABASE"]
+            if database != ":memory:":
+                Path(database).parent.mkdir(parents=True, exist_ok=True)
+            g.db = sqlite3.connect(database, timeout=15)
+            g.db.row_factory = sqlite3.Row
+            g.db.execute("PRAGMA foreign_keys=ON")
+        return g.db
+
+    @app.teardown_appcontext
+    def close_db(_error):
+        connection = g.pop("db", None)
+        if connection is not None:
+            connection.close()
+
+    with app.app_context():
+        db().executescript(
+            """
+            CREATE TABLE IF NOT EXISTS users(
+                id INTEGER PRIMARY KEY, email TEXT UNIQUE NOT NULL,
+                password TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'student'
+            );
+            CREATE TABLE IF NOT EXISTS sessions(
+                token TEXT PRIMARY KEY, uid INTEGER NOT NULL,
+                expires INTEGER NOT NULL,
+                FOREIGN KEY(uid) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS resets(
+                token TEXT PRIMARY KEY, uid INTEGER NOT NULL,
+                expires INTEGER NOT NULL,
+                FOREIGN KEY(uid) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS limits(
+                k TEXT PRIMARY KEY, n INTEGER NOT NULL, level INTEGER NOT NULL,
+                until INTEGER NOT NULL, last INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS tasks(
+                id INTEGER PRIMARY KEY, uid INTEGER NOT NULL, title TEXT NOT NULL,
+                FOREIGN KEY(uid) REFERENCES users(id) ON DELETE CASCADE
+            );
+            """
+        )
+        db().commit()
+
+    def audit(event: str, uid: int | None = None) -> None:
+        # Nunca registrar contraseñas, tokens, cookies ni direcciones de recuperación.
+        app.logger.warning("security_event=%s uid=%s", event, uid if uid is not None else "anonymous")
+
+    def verify_password(encoded: str, candidate: str) -> bool:
+        try:
+            return PASSWORD_HASHER.verify(encoded, candidate)
+        except (VerificationError, InvalidHashError):
+            return False
+
+    def email_input() -> str:
+        return request.form.get("email", "").strip().lower()[:254]
+
+    def institutional_email(email: str) -> bool:
+        local, separator, domain = email.rpartition("@")
+        allowed = tuple(d.lower().lstrip(".") for d in app.config["ALLOWED_EMAIL_DOMAINS"])
+        domain = domain.lower()
+        return bool(local and separator and any(domain == d or domain.endswith("." + d) for d in allowed))
+
+    def rate_keys(email: str, kind: str = "login") -> list[tuple[str, int]]:
+        # Cuenta + IP. request.remote_addr solo representa la IP real si el proxy
+        # de despliegue está configurado como confiable.
+        account_key = f"{kind}:account:{digest(email)}"
+        ip_key = f"{kind}:ip:{digest(request.remote_addr or 'unknown')}"
+        return [(account_key, 5), (ip_key, 20)]
+
+    def blocked_seconds(keys: list[tuple[str, int]]) -> int:
+        now = int(time.time())
+        values = []
+        for key, _threshold in keys:
+            row = db().execute("SELECT until FROM limits WHERE k=?", (key,)).fetchone()
+            if row:
+                values.append(max(0, int(row["until"]) - now))
+        return max(values, default=0)
+
+    def record_attempt(keys: list[tuple[str, int]]) -> None:
+        """Cuenta intentos y aplica espera progresiva (60 s hasta 900 s)."""
+        now = int(time.time())
+        connection = db()
+        for key, threshold in keys:
+            row = connection.execute("SELECT * FROM limits WHERE k=?", (key,)).fetchone()
+            count, level = (row["n"], row["level"]) if row and now - row["last"] < 3600 else (0, 0)
+            count += 1
+            until = 0
+            if count >= threshold:
+                level += 1
+                count = 0
+                until = now + min(900, 60 * (2 ** min(level - 1, 4)))
+            connection.execute(
+                "INSERT OR REPLACE INTO limits(k,n,level,until,last) VALUES(?,?,?,?,?)",
+                (key, count, level, until, now),
+            )
+        connection.commit()
+
+    def clear_account_limit(email: str, kind: str = "login") -> None:
+        db().execute("DELETE FROM limits WHERE k=?", (f"{kind}:account:{digest(email)}",))
+        db().commit()
+
+    def current_user():
+        sid = session.get("sid", "")
+        if not sid:
+            return None
+        return db().execute(
+            "SELECT users.* FROM users JOIN sessions ON users.id=sessions.uid "
+            "WHERE sessions.token=? AND sessions.expires>?",
+            (digest(sid), int(time.time())),
+        ).fetchone()
+
+    @app.before_request
+    def csrf_protection():
+        if request.method == "POST":
+            supplied = request.form.get("csrf", "")
+            expected = session.get("csrf", "")
+            if not expected or not hmac.compare_digest(expected, supplied):
+                abort(400)
+        if "csrf" not in session:
+            session["csrf"] = secrets.token_urlsafe(32)
+
+    @app.after_request
+    def security_headers(response):
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; style-src 'self' 'unsafe-inline'; "
+            "script-src 'self'; frame-ancestors 'none'; form-action 'self'; base-uri 'self'"
+        )
+        if request.is_secure or app.config.get("SESSION_COOKIE_SECURE"):
+            response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        return response
+
+    def page(title: str, msg: str = "", status: int = 200, **context):
+        return render_template("index.html", title=title, msg=msg, **context), status
+
+    def valid_password(password: str) -> bool:
+        return 12 <= len(password) <= 128
+
+    def send_reset_email(email: str, token: str) -> None:
+        sender: Callable | None = app.config.get("RESET_SENDER")
+        if sender:
+            sender(email, token)
+            return
+        required = ("SMTP_USER", "SMTP_PASSWORD", "SMTP_HOST", "BASE_URL")
+        if not all(os.getenv(name) for name in required):
+            raise RuntimeError("Configuración SMTP incompleta")
+        message = EmailMessage()
+        message["Subject"] = "Recuperación de contraseña - Aula Segura"
+        message["From"] = os.environ["SMTP_USER"]
+        message["To"] = email
+        # El fragmento no se envía al servidor ni aparece en los logs HTTP.
+        message.set_content(os.environ["BASE_URL"].rstrip("/") + "/reset#token=" + token)
+        with smtplib.SMTP_SSL(
+            os.environ["SMTP_HOST"], int(os.getenv("SMTP_PORT", "465")), timeout=10
+        ) as smtp:
+            smtp.login(os.environ["SMTP_USER"], os.environ["SMTP_PASSWORD"])
+            smtp.send_message(message)
+
+    @app.route("/", methods=["GET", "POST"])
+    def login():
+        if request.method == "GET":
+            return page("Iniciar sesión")
+        email = email_input()
+        password = request.form.get("password", "")
+        if not institutional_email(email):
+            return page("Iniciar sesión", "Solo se permiten correos institucionales terminados en .edu.pe.", 400)
+        keys = rate_keys(email)
+        wait = blocked_seconds(keys)
+        if wait:
+            return page("Iniciar sesión", f"Acceso temporalmente bloqueado. Reintente en {wait} segundos.", 429)
+        user_row = db().execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+        candidate = password[:128]
+        encoded = user_row["password"] if user_row else DUMMY_HASH
+        valid = verify_password(encoded, candidate) and len(password) <= 128
+        if not user_row or not valid:
+            record_attempt(keys)
+            audit("login_failed")
+            wait = blocked_seconds(keys)
+            message = f"Acceso temporalmente bloqueado. Reintente en {wait} segundos." if wait else "Correo o contraseña incorrectos."
+            return page("Iniciar sesión", message, 429 if wait else 401)
+
+        connection = db()
+        old_sid = session.get("sid", "")
+        if old_sid:
+            connection.execute("DELETE FROM sessions WHERE token=?", (digest(old_sid),))
+        sid = secrets.token_urlsafe(32)
+        connection.execute(
+            "INSERT INTO sessions(token,uid,expires) VALUES(?,?,?)",
+            (digest(sid), user_row["id"], int(time.time()) + SESSION_TTL),
+        )
+        connection.commit()
+        clear_account_limit(email)
+        session.clear()
+        session.permanent = True
+        session.update(sid=sid, csrf=secrets.token_urlsafe(32))
+        audit("login_success", user_row["id"])
+        return redirect("/dashboard")
+
+    @app.route("/register", methods=["GET", "POST"])
+    def register():
+        if request.method == "GET":
+            return page("Registro")
+        email = email_input()
+        password = request.form.get("password", "")
+        if not institutional_email(email):
+            return page("Registro", "Solo se permiten correos institucionales terminados en .edu.pe.", 400)
+        if not valid_password(password):
+            return page("Registro", "La contraseña debe tener entre 12 y 128 caracteres.", 400)
+        # Control de abuso del endpoint: se limita por IP, sin contar el registro
+        # exitoso como un fallo de autenticación de la cuenta.
+        keys = rate_keys(email, "register")
+        wait = blocked_seconds(keys)
+        if wait:
+            return page("Registro", f"Demasiadas solicitudes. Reintente en {wait} segundos.", 429)
+        connection = db()
+        connection.execute("BEGIN IMMEDIATE")
+        # Limitar solicitudes de alta por cuenta/IP (incluye altas exitosas para
+        # evitar automatización masiva, sin mezclarlo con fallos de login).
+        record_attempt(keys)
+        try:
+            connection.execute(
+                "INSERT INTO users(email,password) VALUES(?,?)",
+                (email, PASSWORD_HASHER.hash(password)),
+            )
+            connection.commit()
+            audit("registration_success")
+            return page("Registro", "Cuenta creada correctamente. Ya puede iniciar sesión.")
+        except sqlite3.IntegrityError:
+            connection.rollback()
+            audit("registration_duplicate")
+            return page("Registro", "No fue posible completar el registro con esos datos.", 400)
+
+    @app.route("/dashboard", methods=["GET", "POST"])
+    def dashboard():
+        user_row = current_user()
+        if not user_row:
+            return redirect("/")
+        if request.method == "POST":
+            title = request.form.get("task", "").strip()
+            if not 3 <= len(title) <= 120:
+                abort(400)
+            db().execute("INSERT INTO tasks(uid,title) VALUES(?,?)", (user_row["id"], title))
+            db().commit()
+        tasks = db().execute("SELECT * FROM tasks WHERE uid=? ORDER BY id DESC", (user_row["id"],)).fetchall()
+        return page("Panel de tareas", user=user_row, tasks=tasks)
+
+    @app.post("/logout")
+    def logout():
+        sid = session.get("sid", "")
+        if sid:
+            db().execute("DELETE FROM sessions WHERE token=?", (digest(sid),))
+            db().commit()
+        session.clear()
+        return redirect("/")
+
+    def replace_password(uid: int, password: str) -> None:
+        connection = db()
+        connection.execute("UPDATE users SET password=? WHERE id=?", (PASSWORD_HASHER.hash(password), uid))
+        connection.execute("DELETE FROM sessions WHERE uid=?", (uid,))
+        connection.execute("DELETE FROM resets WHERE uid=?", (uid,))
+        connection.commit()
+        audit("password_updated", uid)
+
+    @app.route("/change", methods=["GET", "POST"])
+    def change_password():
+        user_row = current_user()
+        if not user_row:
+            return redirect("/")
+        if request.method == "GET":
+            return page("Cambiar contraseña")
+        current = request.form.get("current", "")[:128]
+        new_password = request.form.get("password", "")
+        if not verify_password(user_row["password"], current):
+            audit("password_change_failed", user_row["id"])
+            return page("Cambiar contraseña", "La contraseña actual es incorrecta.", 401)
+        if not valid_password(new_password):
+            return page("Cambiar contraseña", "La nueva contraseña debe tener entre 12 y 128 caracteres.", 400)
+        replace_password(user_row["id"], new_password)
+        session.clear()
+        return redirect("/")
+
+    @app.route("/forgot", methods=["GET", "POST"])
+    def forgot_password():
+        if request.method == "GET":
+            return page("Recuperar contraseña")
+        email = email_input()
+        if not institutional_email(email):
+            return page("Recuperar contraseña", "Si existe una cuenta elegible, recibirá instrucciones por correo.", 400)
+        keys = rate_keys(email, "forgot")
+        wait = blocked_seconds(keys)
+        if wait:
+            return page("Recuperar contraseña", "Si existe una cuenta elegible, recibirá instrucciones por correo.")
+        record_attempt(keys)
+        user_row = db().execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+        if user_row:
+            token = secrets.token_urlsafe(32)
+            connection = db()
+            connection.execute("DELETE FROM resets WHERE uid=?", (user_row["id"],))
+            connection.execute(
+                "INSERT INTO resets(token,uid,expires) VALUES(?,?,?)",
+                (digest(token), user_row["id"], int(time.time()) + RESET_TTL),
+            )
+            connection.commit()
+            audit("reset_requested", user_row["id"])
+            try:
+                send_reset_email(email, token)
+            except Exception:
+                audit("mail_delivery_failed", user_row["id"])
+        return page("Recuperar contraseña", "Si existe una cuenta elegible, recibirá instrucciones por correo.")
+
+    @app.route("/reset", methods=["GET", "POST"])
+    def reset_password():
+        if request.method == "GET":
+            return page("Restablecer contraseña")
+        token = request.form.get("token", "")
+        password = request.form.get("password", "")
+        if not valid_password(password):
+            return page("Restablecer contraseña", "La contraseña debe tener entre 12 y 128 caracteres.", 400)
+        connection = db()
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT uid FROM resets WHERE token=? AND expires>?",
+            (digest(token), int(time.time())),
+        ).fetchone()
+        if not row:
+            connection.rollback()
+            audit("reset_invalid_or_expired")
+            return page("Restablecer contraseña", "Enlace inválido o expirado.", 400)
+        uid = row["uid"]
+        # Consumir token y cambiar contraseña en una transacción para impedir reutilización concurrente.
+        connection.execute("DELETE FROM resets WHERE token=?", (digest(token),))
+        connection.execute("UPDATE users SET password=? WHERE id=?", (PASSWORD_HASHER.hash(password), uid))
+        connection.execute("DELETE FROM sessions WHERE uid=?", (uid,))
+        connection.execute("DELETE FROM resets WHERE uid=?", (uid,))
+        connection.commit()
+        audit("password_reset_completed", uid)
+        session.clear()
+        return redirect("/")
+
+    return app
+
+
+if __name__ == "__main__":
+    create_app().run()
